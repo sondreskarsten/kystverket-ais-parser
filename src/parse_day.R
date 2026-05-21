@@ -17,8 +17,8 @@ yr <- parts[1]; mn <- parts[2]; dy <- parts[3]
 
 cat(sprintf("[%s] parser day=%s\n", format(Sys.time(), "%H:%M:%S"), TARGET_DAY))
 
-con <- dbConnect(duckdb(), dbdir = file.path(LOCAL_DIR, "work.duckdb"))
-dbExecute(con, "SET memory_limit='1GB'")
+con <- dbConnect(duckdb(), dbdir = ":memory:")
+dbExecute(con, "SET memory_limit='1500MB'")
 dbExecute(con, "SET threads=2")
 
 cat("  loading positions into DuckDB...\n")
@@ -171,29 +171,9 @@ if (has_voyages) {
 
 dbDisconnect(con, shutdown = TRUE)
 
-cat(sprintf("[%s] uploading to GCS\n", format(Sys.time(), "%H:%M:%S")))
-gcs <- GcsFileSystem$create(
-  json_credentials = paste(readLines(SA_KEY, warn = FALSE), collapse = "")
-)
-
-silver_map <- list(
-  "positions_decoded.parquet" = sprintf("ais/silver/positions_decoded/year=%s/month=%s/day=%s.parquet", yr, mn, dy),
-  "vessel_registry.parquet" = sprintf("ais/silver/vessel_registry/%s.parquet", TARGET_DAY),
-  "voyages_maru.parquet" = sprintf("ais/silver/voyages_maru/year=%s/month=%s/day=%s.parquet", yr, mn, dy),
-  "voyages_kystverket.parquet" = sprintf("ais/silver/voyages_kystverket/%s.parquet", TARGET_DAY)
-)
-
-for (fname in names(silver_map)) {
-  local <- file.path(out_dir, fname)
-  if (file.exists(local) && file.size(local) > 0) {
-    tbl <- read_parquet(local)
-    out_stream <- gcs$OpenOutputStream(paste0(BUCKET, "/", silver_map[[fname]]))
-    write_parquet(tbl, out_stream)
-    out_stream$close()
-    cat(sprintf("  → gs://%s/%s (%s bytes)\n", BUCKET, silver_map[[fname]],
-        format(file.size(local), big.mark = ",")))
-  }
+out_files <- list.files(out_dir, pattern = "\\.parquet$", full.names = TRUE)
+for (f in out_files) {
+  cat(sprintf("  local: %s (%s bytes)\n", basename(f), format(file.size(f), big.mark = ",")))
 }
-
-unlink(LOCAL_DIR, recursive = TRUE)
-cat(sprintf("[%s] DONE day=%s\n", format(Sys.time(), "%H:%M:%S"), TARGET_DAY))
+cat(sprintf("[%s] DONE day=%s (local only, upload handled by caller)\n",
+    format(Sys.time(), "%H:%M:%S"), TARGET_DAY))
