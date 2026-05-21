@@ -45,23 +45,32 @@ gs://sondre_brreg_data/ais/silver/
         For comparison against voyages_maru.
 ```
 
-## Decoding plan for positions c4..c11
+## Positions column decoding (VERIFIED)
 
-Provisional (to be verified against ITU-R M.1371 + cross-checks with
-BarentsWatch `/v1/combined` and Kystverket NMEA TCP):
+Decoded May 2026 via cross-vessel statistical analysis + exact numerical verification against known vessels (AKKARFJORD 257023700, ARNOYTIND 257127870, BARENTS SEA 257388000). Every check passes with exact numerical match.
 
-| col | name | type | source |
-|---|---|---|---|
-| `c4` | `sog` | float | speed over ground (kn), 102.3 = NA |
-| `c5` | `unknown_1` | float | hypothesis: ?; probe |
-| `c6` | `ship_type` | int | ITU ship-type code; 30 = fishing, 70-79 = cargo, 80-89 = tanker |
-| `c7` | `unknown_2` | float | ? |
-| `c8` | `cog` | int | course over ground (deg × 1?) |
-| `c9` | `nav_status` | int | 0=under way, 1=anchored, 5=moored, 7=fishing, 15=undefined |
-| `c10` | `true_heading` | int | 0..359, 511=NA |
-| `c11` | `rot` | int | rate of turn signed |
+| col | name | type | description | sentinel |
+|---|---|---|---|---|
+| `mmsi` | mmsi | int64 | MMSI | — |
+| `msgtime` | msgtime | string | ISO datetime (Oslo local time, not UTC) | — |
+| `lon` | lon | double | longitude WGS84 | — |
+| `lat` | lat | double | latitude WGS84 | — |
+| `c4` | cog | double | course over ground, degrees | 360.0 = NA |
+| `c5` | sog | double | speed over ground, knots (from AIS message) | 102.3 = NA |
+| `c6` | msg_type | int64 | AIS message type (1, 3 = Class A; 18 = Class B) | — |
+| `c7` | calc_speed | double | speed from consecutive position deltas, knots | -99 = NA |
+| `c8` | delta_seconds | int64 | seconds since previous position for this MMSI | -99 = NA |
+| `c9` | delta_meters | int64 | distance from previous position, meters | -99 = NA |
+| `c10` | true_heading | int64 | true heading, degrees | 511 = NA |
+| `c11` | rot | int64 | rate of turn, decoded °/min | -731 = NA/max left, -99 = Class B NA |
 
-Validation: pick a vessel with known characteristics (e.g. MMSI 258500000 = RICHARD WITH, Hurtigruten ferry), pull simultaneously from BarentsWatch combined and Kystverket positions, compare field values.
+**Key finding**: kystdatahuset pre-computes `calc_speed`, `delta_seconds`, `delta_meters` server-side. These map directly to MarU's `delta_previous_point_seconds` and `distance_previous_point_meters`. The voyage-segmentation preprocessing is done for us — the parser needs only the phase-labelling logic (SOG thresholds + H3 spatial gates), not the point-to-point delta computation.
+
+**Missing from kystdatahuset positions**: `nav_status` (0=under way, 1=anchored, 5=moored, 7=fishing) and `ship_type` (30=fishing, 70-79=cargo, 80-89=tanker) are NOT in the 12-column position array. Both are required by MarU rules. `ship_type` must be joined from statinfo (NSR); `nav_status` is structurally unavailable from kystdatahuset — it exists in the hais.kystverket.no Parquet schema (`status` column) and in raw NMEA Type 1/2/3 messages but kystdatahuset strips it. This means the MarU "anchored" and "fishing by nav_status" rules cannot be applied to kystdatahuset-sourced data. The parser must fall back to SOG-only phase labelling, which MarU itself also supports as a degraded mode.
+
+Verification method: `calc_speed = (delta_meters / delta_seconds) × (3600/1852)` matches `c7` to 1 decimal place for every row tested. `delta_seconds` matches `(msgtime[i] - msgtime[i-1]).total_seconds()` exactly for consecutive same-MMSI rows.
+
+Class B rows (msg_type=18) have `calc_speed=-99`, `delta_seconds=-99`, `delta_meters=-99`, `rot=-99` — the backend does not compute deltas for Class B positions (lower reporting cadence makes inter-position deltas less meaningful).
 
 ## Resolution chain (mmsi → orgnr)
 
