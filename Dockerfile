@@ -8,6 +8,7 @@ WORKDIR /app
 
 COPY src/parse_day.R ./parse_day.R
 COPY src/entrypoint.py ./entrypoint.py
+COPY src/entrypoint_daily.py ./entrypoint_daily.py
 
 ENV PARSE_SCRIPT=/app/parse_day.R
 ENV RSCRIPT_PATH=/usr/bin/Rscript
