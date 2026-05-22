@@ -1,106 +1,96 @@
 # kystverket-ais-parser
 
-Pipeline (R + DuckDB) that converts the immutable observations from `kystverket-ais-collector` into enriched silver layers consumable by downstream models and dashboards.
+Transforms raw AIS observations into enriched, queryable outputs. Two-stage pipeline: first decodes positions and resolves vessel identity (Layer 1), then derives voyage segments with activity classification (Layer 3 gold).
 
-## Inputs (from kystverket-ais-collector)
+## What does it produce?
 
-```
-gs://sondre_brreg_data/ais/raw/
-├── positions/year=YYYY/month=MM/day=DD/hour=HH.parquet   12-col API array
-├── statinfo/year=YYYY/month=MM/day=DD.parquet            NSR vessel registry
-├── voyages/year=YYYY/month=MM/day=DD.parquet             Kystverket pre-computed voyages
-```
+### Stage 1: Parsed positions (Layer 1)
 
-Cross-pipeline inputs:
+Each AIS position row, decoded from the unnamed API array into named fields, indexed spatially with H3 hexagons, and keyed to a corporate identity (orgnr) where possible.
 
 ```
-gs://sondre_brreg_data/fiskeridir/parsed/v1/state/{date}.parquet
-                                                       4,662 fishing vessels
-                                                       orgnr ↔ radio_call_sign bridge
+ais/parsed/positions/year=YYYY/month=MM/day=DD.parquet
 ```
 
-## Outputs
+14 columns: `mmsi, msgtime, lon, lat, cog, sog, msg_type, calc_speed, sec_prevpoint, dist_prevpoint, true_heading, rot, h3_r8, orgnr`
+
+**The only cross-source join at this layer** is the orgnr bridge: `mmsi → NSR callsign → fartøyregisteret radio_call_sign → orgnr`. This join is admissible because it is the only way to attach a corporate identity to an AIS position. No vessel attributes, no activity labels, no derived metrics — those live in the gold layer.
+
+**H3 resolution 8**: each position is tagged with its H3 hexagonal cell ID (~0.74 km² per cell). This converts all spatial queries from geometry computations to integer equality checks. "Which vessels were near Bergen port today?" becomes `WHERE h3_r8 IN ('612345...', '612346...')`.
+
+### Stage 2: Voyage segments (Layer 3 gold)
+
+Derived from parsed positions + NSR ship type. Classifies every position into an activity phase, groups consecutive non-stopped positions into voyages (sail segments), and summarizes each voyage.
 
 ```
-gs://sondre_brreg_data/ais/silver/
-├── positions_decoded/year=YYYY/month=MM/day=DD/hour=HH.parquet
-│       Same as raw, but with c4..c11 decoded to AIS fields
-│       (sog, cog, ship_type, true_heading, nav_status, rate_of_turn, etc.)
-│
-├── vessel_registry/{date}.parquet
-│       Per-MMSI per-day registry snapshot, combining NSR + Fartøyregisteret +
-│       Brønnøysund. Resolves mmsi → callsign → orgnr where possible. Slowly-
-│       changing dimension (SCD2) keyed on (mmsi, valid_from).
-│
-├── voyages_maru/year=YYYY/month=MM/day=DD/voyage_segments.parquet
-│       MarU voyage segmentation derived from positions_decoded.
-│       Phase labels: a/n/c/m/dp-o/f/p (anchor/node/cruise/manoeuvre/DP/fishing/shore-power)
-│       sail_id assignment per the "is_stopped >50%" rule.
-│       H3 res-8 indexing per row for spatial joins.
-│       Re-implementation of github.com/Kystverket/maru rules; not the same
-│       outputs (we don't compute emissions).
-│
-└── voyages_kystverket/{date}.parquet
-        Lightly-cleaned passthrough of voyages/ with orgnr enrichment.
-        For comparison against voyages_maru.
+ais/gold/voyages_maru/year=YYYY/month=MM/day=DD.parquet
 ```
 
-## Positions column decoding (VERIFIED)
+21 columns per sail segment:
 
-Decoded May 2026 via cross-vessel statistical analysis + exact numerical verification against known vessels (AKKARFJORD 257023700, ARNOYTIND 257127870, BARENTS SEA 257388000). Every check passes with exact numerical match.
+| Field | Description |
+|---|---|
+| `mmsi`, `sail_id` | Vessel + unique voyage identifier |
+| `n_positions` | Position count in this segment |
+| `start_time`, `end_time` | Voyage temporal bounds |
+| `mean_sog`, `max_sog` | Speed statistics (knots) |
+| `start_lon/lat`, `end_lon/lat` | Origin and destination coordinates |
+| `start_h3`, `end_h3` | Origin and destination H3 cells |
+| `n_h3_cells` | Spatial extent — number of distinct hex cells traversed |
+| `pct_fishing`, `pct_cruising` | Activity phase distribution (percentage) |
+| `shipname`, `shiptypenor`, `orgnr` | Vessel identity (from NSR + fartøyregisteret) |
+| `is_fishing` | Boolean: NSR ship type = fishing vessel |
 
-| col | name | type | description | sentinel |
-|---|---|---|---|---|
-| `mmsi` | mmsi | int64 | MMSI | — |
-| `msgtime` | msgtime | string | ISO datetime (Oslo local time, not UTC) | — |
-| `lon` | lon | double | longitude WGS84 | — |
-| `lat` | lat | double | latitude WGS84 | — |
-| `c4` | cog | double | course over ground, degrees | 360.0 = NA |
-| `c5` | sog | double | speed over ground, knots (from AIS message) | 102.3 = NA |
-| `c6` | msg_type | int64 | AIS message type (1, 3 = Class A; 18 = Class B) | — |
-| `c7` | calc_speed | double | speed from consecutive position deltas, knots | -99 = NA |
-| `c8` | delta_seconds | int64 | seconds since previous position for this MMSI | -99 = NA |
-| `c9` | delta_meters | int64 | distance from previous position, meters | -99 = NA |
-| `c10` | true_heading | int64 | true heading, degrees | 511 = NA |
-| `c11` | rot | int64 | rate of turn, decoded °/min | -731 = NA/max left, -99 = Class B NA |
+**Phase classification** (MarU-inspired, SOG-only mode):
 
-**Key finding**: kystdatahuset pre-computes `calc_speed`, `delta_seconds`, `delta_meters` server-side. These map directly to MarU's `delta_previous_point_seconds` and `distance_previous_point_meters`. The voyage-segmentation preprocessing is done for us — the parser needs only the phase-labelling logic (SOG thresholds + H3 spatial gates), not the point-to-point delta computation.
+| Phase | Rule | Interpretation |
+|---|---|---|
+| `fishing` | Fishing vessel + SOG 0.3–5 kn | Actively trawling or setting gear |
+| `node` | SOG ≤ 0.3 kn | In port, at anchor, or stationary |
+| `manoeuvring` | SOG ≤ 3 kn (non-fishing) | Harbour approach, docking, waiting |
+| `cruising` | SOG > 3 kn | Transit between grounds or ports |
 
-**Missing from kystdatahuset positions**: `nav_status` (0=under way, 1=anchored, 5=moored, 7=fishing) and `ship_type` (30=fishing, 70-79=cargo, 80-89=tanker) are NOT in the 12-column position array. Both are required by MarU rules. `ship_type` must be joined from statinfo (NSR); `nav_status` is structurally unavailable from kystdatahuset — it exists in the hais.kystverket.no Parquet schema (`status` column) and in raw NMEA Type 1/2/3 messages but kystdatahuset strips it. This means the MarU "anchored" and "fishing by nav_status" rules cannot be applied to kystdatahuset-sourced data. The parser must fall back to SOG-only phase labelling, which MarU itself also supports as a degraded mode.
+**Sail-ID assignment**: a new sail begins when a vessel transitions from `node` (stopped) to any non-stopped phase. This partitions each vessel's day into discrete trips. A trawler might have 3 sails: morning transit to grounds → fishing → return to port.
 
-Verification method: `calc_speed = (delta_meters / delta_seconds) × (3600/1852)` matches `c7` to 1 decimal place for every row tested. `delta_seconds` matches `(msgtime[i] - msgtime[i-1]).total_seconds()` exactly for consecutive same-MMSI rows.
-
-Class B rows (msg_type=18) have `calc_speed=-99`, `delta_seconds=-99`, `delta_meters=-99`, `rot=-99` — the backend does not compute deltas for Class B positions (lower reporting cadence makes inter-position deltas less meaningful).
+**`n_h3_cells` as activity fingerprint**: a trawler working one ground touches 50-150 cells; a cargo vessel transiting the coast touches 500+. This single integer separates operational patterns without geometry computation.
 
 ## Resolution chain (mmsi → orgnr)
 
-Empirical on 2025-04-01 hour-00:
-- 1 961 distinct MMSIs in EEZ
-- 1 089 (55.5%) match NSR vessel registry
-- 181 (9.2%) match Fartøyregisteret → orgnr (fishing vessels only)
+```
+AIS position (mmsi 258500000)
+  → NSR statinfo (callsign "LGWH")
+    → Fartøyregisteret (radio_call_sign "LGWH" → orgnr "979356749")
+```
 
-The drop from NSR → Fartøyregisteret is expected: Fartøyregisteret only contains fishing vessels (~4 662 in total). For non-fishing vessels (cargo, passenger, tanker), orgnr resolution requires Sjøfartsdirektoratet ship register or commercial sources — not yet wired.
+Empirical coverage (1 hour, Norwegian EEZ):
+- 1,961 distinct MMSIs observed
+- 1,089 (56%) resolve to NSR vessel registry
+- 181 (9%) resolve all the way to a fartøyregisteret orgnr
 
-## MarU voyage segmentation rules
+The 9% hit rate is expected: fartøyregisteret contains only Norwegian fishing vessels (~4,665). The other 91% are foreign fishing vessels, cargo ships, tankers, and passenger vessels whose orgnr resolution requires the Sjøfartsdirektoratet ship register (not yet wired).
 
-Source: `Method description MarU Rev. 0`, github.com/Kystverket/maru
+## GCS layout
 
-| Phase | SOG rule | Spatial rule |
-|---|---|---|
-| Node (port/anchor) | not "underway" (MA SOG ≤ 0.3 kn) | ≤1 H3 r8 hex from shore |
-| Manoeuvring | ≤ 3 kn | else |
-| Cruising | > 3 kn | else |
-| Fishing | < 5 kn | ship_type=30 AND ≥6 hex offshore AND ≥1 hex from port |
-| DP-1 | ≤ 0.5 kn | offshore vessel; ≥9 hex from shore; ≤2 hex from oil installation |
-| Anchorage | not "underway" | inside NCA-designated anchorage polygon |
-| Shore-power | Node ≥ 2 hours | ≤1 hex from registered shore-power installation |
+```
+gs://sondre_brreg_data/ais/
+├── parsed/
+│   ├── positions/year=YYYY/month=MM/day=DD.parquet   (Layer 1: 14 cols)
+│   └── _checkpoint/parser.json
+└── gold/
+    ├── voyages_maru/year=YYYY/month=MM/day=DD.parquet (Layer 3: 21 cols)
+    ├── voyages_kystverket/{date}.parquet               (passthrough + orgnr)
+    ├── fleet_panel.parquet                             (cross-source materialization)
+    └── capacity_utilization.parquet                    (FDIR-format benchmarks)
+```
 
-Voyage segment minimum length: 5 minutes.
+## Cloud Run
 
-"Is stopped" segment: Node phase > 50% of segment duration.
+- **Backfill job**: `kystverket-ais-parser` (R + DuckDB on r-base image, 4CPU/16Gi)
+- **Daily job**: `kystverket-ais-parser-daily` (60-day rolling window)
+- **Schedule**: 08:00 Oslo daily (2h after collector)
+- **Runtime**: ~3 min per day (download ~90s + R processing ~80s + upload ~20s)
 
-sail_id: one ID per run of non-"Is stopped" segments between two "Is stopped" segments.
+## Upstream dependencies
 
-## Status
-
-Not yet implemented. Scaffolded only.
+← **kystverket-ais-collector**: positions, statinfo, voyages in `ais/raw/`
+← **fiskeridir-parser**: `fiskeridir/parsed/v1/state/{date}.parquet` for the callsign→orgnr bridge
