@@ -162,6 +162,7 @@ def main():
     last_save = time.time()
 
     for day in todo:
+        fs = gcs_fs()
         result = process_day(day, fs, fartoy_local)
         if result == "ok":
             ok += 1
