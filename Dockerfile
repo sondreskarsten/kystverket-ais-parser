@@ -1,7 +1,7 @@
 FROM europe-north1-docker.pkg.dev/sondreskarsten-d7d14/r-images/r-base:latest
 
 RUN apt-get update && apt-get install -y --no-install-recommends python3-pip && \
-    pip3 install --no-cache-dir pyarrow google-auth && \
+    pip3 install --no-cache-dir pyarrow google-auth requests && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
