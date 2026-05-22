@@ -20,6 +20,8 @@ cat(sprintf("[%s] parser day=%s\n", format(Sys.time(), "%H:%M:%S"), TARGET_DAY))
 con <- dbConnect(duckdb(), dbdir = ":memory:")
 dbExecute(con, "SET memory_limit='1500MB'")
 dbExecute(con, "SET threads=2")
+dbExecute(con, "INSTALL h3 FROM community")
+dbExecute(con, "LOAD h3")
 
 cat("  loading positions into DuckDB...\n")
 dbExecute(con, sprintf("
@@ -78,6 +80,7 @@ select_extra <- if (has_statinfo && has_fartoy) {
 dbExecute(con, sprintf("
   CREATE TABLE enriched AS
   SELECT p.* %s,
+    h3_latlng_to_cell(p.lat, p.lon, 8)::VARCHAR AS h3_r8,
     CASE
       WHEN (COALESCE(v.shiptypegroupnor = 'Fisk', false)
             OR COALESCE(v.shiptypenor LIKE '%%ishing%%', false))
@@ -139,6 +142,8 @@ dbExecute(con, sprintf("
       round(avg(cog), 1) AS mean_cog,
       first(lon) AS start_lon, first(lat) AS start_lat,
       last(lon) AS end_lon, last(lat) AS end_lat,
+      first(h3_r8) AS start_h3, last(h3_r8) AS end_h3,
+      count(DISTINCT h3_r8) AS n_h3_cells,
       round(100.0 * avg(CASE WHEN phase='fishing' THEN 1.0 ELSE 0.0 END), 1) AS pct_fishing,
       round(100.0 * avg(CASE WHEN phase='cruising' THEN 1.0 ELSE 0.0 END), 1) AS pct_cruising,
       first(shipname) AS shipname, first(shiptypenor) AS shiptypenor,
